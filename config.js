@@ -1,3 +1,2 @@
-// ÚNICA configuração do app: cole entre as aspas o link do servidor
-// (Planilha > menu Grupo de Estudos > Ver link do servidor).
-window.SERVIDOR = "COLE_AQUI_O_LINK_DO_SERVIDOR";
+// ÚNICA configuração do app: link do servidor (Planilha > Grupo de Estudos > Ver link do servidor).
+window.SERVIDOR = "https://script.google.com/macros/s/AKfycbyp_DAv9TPxTxHcPHHH7ccWedTreQYHpPAY0KVCJGpZuub6R8b2JryMUSdulZFkl2nZ-w/exec";

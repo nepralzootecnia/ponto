@@ -20,7 +20,7 @@ const st = {
   token: LS.get('token'),
   dados: null,
   timer: null,
-  admin: { senha: LS.get('senhaCoord') || null, dados: null, aba: 'agora', filtroAtiv: 'Pendente', mes: null, rel: null }
+  admin: { senha: LS.get('senhaCoord') || null, dados: null, aba: 'agora', filtroAtiv: 'abertas', mes: null, rel: null }
 };
 
 const $ = (s, el = document) => el.querySelector(s);
@@ -46,16 +46,21 @@ const iniciais = n => String(n || '?').trim().split(/\s+/).map(p => p[0]).slice(
 function pctClasse(p) { return p == null ? '' : p >= 90 ? 'bom' : p >= 70 ? 'medio' : 'ruim'; }
 
 /* ------------------------- comunicação ------------------------- */
-async function api(acao, dados = {}) {
+function erroRede(msg) { const e = new Error(msg); e.rede = true; return e; }
+async function api(acao, dados = {}, opts = {}) {
   if (!SERVIDOR || SERVIDOR.indexOf('COLE_AQUI') >= 0) throw new Error('O link do servidor ainda não foi colocado no arquivo config.js.');
-  let r;
+  if (navigator.onLine === false) throw erroRede('Você está sem internet. Vá para um lugar com sinal e tente de novo.');
+  const ctl = window.AbortController ? new AbortController() : null;
+  const limite = setTimeout(() => ctl && ctl.abort(), opts.tempo || 40000);
+  let r, j;
   try {
-    r = await fetch(SERVIDOR, { method: 'POST', body: JSON.stringify(Object.assign({ acao }, dados)) });
+    r = await fetch(SERVIDOR, { method: 'POST', body: JSON.stringify(Object.assign({ acao }, dados)), signal: ctl ? ctl.signal : undefined });
+    j = await r.json();
   } catch (e) {
-    throw new Error('Sem conexão com o servidor. Verifique a internet e tente de novo.');
-  }
-  let j;
-  try { j = await r.json(); } catch (e) { throw new Error('O servidor não respondeu corretamente. Tente de novo.'); }
+    throw erroRede(e && e.name === 'AbortError'
+      ? 'A internet está muito lenta e o servidor não respondeu. Tente de novo num lugar com sinal melhor.'
+      : 'Sem conexão com o servidor. Verifique a internet e tente de novo.');
+  } finally { clearTimeout(limite); }
   if (!j.ok) {
     const err = new Error(String(j.erro || 'Erro').replace(/^TOKEN:\s*/, ''));
     err.token = String(j.erro || '').indexOf('TOKEN:') === 0;
@@ -63,6 +68,91 @@ async function api(acao, dados = {}) {
   }
   return j.dados;
 }
+
+/* ------------------------- dados guardados no celular (uso sem internet) ------------------------- */
+function lerJSON(k) { try { return JSON.parse(LS.get(k) || 'null'); } catch (e) { return null; } }
+function salvarCache(d) { const c = Object.assign({}, d); delete c._offline; LS.set('cacheStatus', JSON.stringify({ token: st.token, dados: c })); }
+function lerCache() { const c = lerJSON('cacheStatus'); return c && c.token === st.token ? c.dados : null; }
+const chaveSessao = ab => ab ? dataCurta(ab.entrada) + ' ' + hora(ab.entrada) : '';
+function lerRasc(ab) {
+  const r = lerJSON('rascunhoSaida');
+  const ok = r && r.sessao === chaveSessao(ab) ? r : { sessao: chaveSessao(ab), feitas: [], obs: '' };
+  ok.terminou = ok.terminou || [];
+  return ok;
+}
+
+/* ------------------------- ponto sem internet ------------------------- */
+const Fila = {
+  ler() { return lerJSON('filaPontos') || []; },
+  salvar(f) { LS.set('filaPontos', JSON.stringify(f)); },
+  add(it) { const f = this.ler(); f.push(it); this.salvar(f); }
+};
+function offsetRelogio() { const v = LS.get('offsetRelogio'); return v === null || !isFinite(Number(v)) ? null : Number(v); }
+function guardaRelogio(servidorAgora) { if (servidorAgora && isFinite(servidorAgora)) LS.set('offsetRelogio', String(servidorAgora - Date.now())); }
+function novoUid() { return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10); }
+function distM(la1, lo1, la2, lo2) {
+  const R = 6371000, rad = Math.PI / 180, dLa = (la2 - la1) * rad, dLo = (lo2 - lo1) * rad;
+  const x = Math.sin(dLa / 2) ** 2 + Math.cos(la1 * rad) * Math.cos(la2 * rad) * Math.sin(dLo / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+// Confere rosto e local no próprio celular (o servidor confere de novo quando o ponto chegar)
+function conferirNoCelular(desc, loc, off) {
+  if (!off) throw new Error('Sem internet. Abra o app uma vez com internet para liberar o ponto offline.');
+  if (!off.permitido) throw new Error('Sem internet, e o ponto offline está desativado pelo coordenador. Vá para um lugar com sinal.');
+  if (!off.rosto || !off.rosto.length) throw new Error('Sem internet. Abra o app uma vez com internet para liberar o ponto offline.');
+  const dist = Math.min.apply(null, off.rosto.map(r => Math.sqrt(r.reduce((s, v, i) => s + (v - desc[i]) * (v - desc[i]), 0))));
+  if (dist > off.limiar) throw new Error('Rosto não reconhecido. Tente em um lugar mais iluminado, de frente para a câmera.');
+  let melhor = null;
+  (off.locais || []).forEach(l => {
+    const d = Math.round(distM(loc.lat, loc.lng, l.lat, l.lng));
+    if (!melhor || d - l.raio < melhor.folga) melhor = { folga: d - l.raio, nome: l.nome, dist: d };
+  });
+  if (off.exigirLocal) {
+    if (!melhor) throw new Error('Nenhum local cadastrado pelo coordenador.');
+    if (melhor.folga > 0) throw new Error('Você está a ' + melhor.dist + ' m de "' + melhor.nome + '". Bata o ponto dentro do setor.');
+  }
+  return melhor && melhor.folga <= 0 ? melhor.nome : '';
+}
+function aplicarFila(d) {
+  Fila.ler().forEach(it => {
+    const h = new Date(it.horaCelular + (it.offsetAntes || 0)).toISOString();
+    d.aberto = it.tipo === 'entrada' ? { entrada: h, local: it.local || '', offline: true } : null;
+  });
+  return d;
+}
+let sincronizando = null;
+function sincronizar(silencioso) {
+  if (sincronizando) return sincronizando;
+  const fila = Fila.ler();
+  if (!fila.length || !st.token) return Promise.resolve(null);
+  sincronizando = (async () => {
+    try {
+      const r = await api('sincronizar', { token: st.token, celularAgora: Date.now(), itens: fila }, { tempo: 40000 });
+      guardaRelogio(r.servidorAgora);
+      const feitos = new Set(r.resultados.map(x => x.uid));
+      Fila.salvar(Fila.ler().filter(it => !feitos.has(it.uid)));
+      const recusados = r.resultados.filter(x => !x.ok);
+      if (recusados.length) {
+        const av = lerJSON('avisosPonto') || [];
+        recusados.forEach(x => { const it = fila.find(f => f.uid === x.uid); av.push({ tipo: x.tipo, erro: x.erro, hora: it ? new Date(it.horaCelular + (it.offsetAntes || 0)).toISOString() : '' }); });
+        LS.set('avisosPonto', JSON.stringify(av.slice(-10)));
+      }
+      const aceitos = r.resultados.filter(x => x.ok && !x.repetido).length;
+      if (!silencioso || aceitos) toast(aceitos + ' ponto(s) guardado(s) enviado(s) ✓', 'ok');
+      return r;
+    } catch (e) {
+      if (e.token) { sairDoCelular(); render(); }
+      return null;
+    } finally { sincronizando = null; }
+  })();
+  return sincronizando;
+}
+function podeRedesenhar() { return st.token && location.hash !== '#coordenador' && !$('.tela') && !$('.cam') && !$('.carregando'); }
+window.addEventListener('online', () => { if (st.token && Fila.ler().length) sincronizar(true).then(r => { if (r && podeRedesenhar()) telaAluno(); }); });
+setInterval(() => {
+  if (st.token && Fila.ler().length && navigator.onLine !== false) sincronizar(true).then(r => { if (r && podeRedesenhar()) telaAluno(); });
+}, 60000);
+function salvarRasc(r) { LS.set('rascunhoSaida', JSON.stringify(r)); }
 
 /* ------------------------- avisos e telas ------------------------- */
 let toastT;
@@ -318,20 +408,33 @@ function passoCodigo(info, aluno) {
    ALUNO – TELA PRINCIPAL
    ================================================================ */
 async function telaAluno() {
-  if (!st.dados) app().innerHTML = topo('Ponto do Grupo') + '<main><div class="card"><div class="vazio">Carregando…</div></div></main>';
+  if (!st.dados) st.dados = lerCache();
+  if (st.dados) mostrarAluno(st.dados, true);   // mostra na hora o que está guardado no celular
+  else app().innerHTML = topo('Ponto do Grupo') + '<main><div class="card"><div class="vazio">Carregando…</div></div></main>';
   try {
-    st.dados = await api('status', { token: st.token });
+    if (Fila.ler().length) await sincronizar(true);
+    const d = await api('status', { token: st.token }, { tempo: 20000 });
+    guardaRelogio(d.servidorAgora);
+    d._salvoEm = Date.now();
+    st.dados = aplicarFila(d);
+    salvarCache(st.dados);
   } catch (e) {
-    if (e.token) { LS.del('token'); st.token = null; st.dados = null; toast(e.message, 'erro'); return render(); }
+    if (e.token) { sairDoCelular(); toast(e.message, 'erro'); return render(); }
+    if (st.dados && e.rede) { st.dados._offline = true; return mostrarAluno(st.dados); }
     app().innerHTML = topo('Ponto do Grupo') + '<main><div class="aviso erro">' + esc(e.message) + '</div><button class="btn" id="tentar">Tentar de novo</button></main>';
     $('#tentar').onclick = render;
     return;
   }
-  const d = st.dados;
+  mostrarAluno(st.dados);
+}
+function mostrarAluno(d, atualizando) {
   if (d.aluno.rostoStatus !== 'Aprovado') return telaAguardando(d);
-  pintaAluno(d);
-  // pré-carrega o reconhecimento facial em segundo plano
-  Rosto.carregar().catch(() => {});
+  pintaAluno(d, atualizando);
+  Rosto.carregar().catch(() => {}); // deixa o reconhecimento facial pronto (fica guardado para usar sem internet)
+}
+function sairDoCelular() {
+  ['token', 'cacheStatus', 'filaPontos', 'rascunhoSaida', 'avisosPonto', 'offsetRelogio'].forEach(k => LS.del(k));
+  st.token = null; st.dados = null;
 }
 
 function telaAguardando(d) {
@@ -343,30 +446,42 @@ function telaAguardando(d) {
   ligaRodape();
 }
 
-function pintaAluno(d) {
+function pintaAluno(d, atualizando) {
   const ab = d.aberto;
   const m = d.mes;
   const pctMes = m.planejado > 0 ? Math.min(100, Math.round(m.realizado / m.planejado * 100)) : 0;
   const hojeTxt = d.horarioHoje.length ? d.horarioHoje.map(h => h.inicio + '–' + h.fim).join(' e ') : 'Sem horário planejado hoje';
   const pend = d.pendentes;
+  const fila = Fila.ler();
+  const avisos = lerJSON('avisosPonto') || [];
 
   app().innerHTML = topo(d.grupo, 'Olá, ' + d.aluno.nome.split(' ')[0] + '!', '<button id="atualizar" aria-label="Atualizar">↻</button>') +
     '<main>' +
+    (d._offline ? '<div class="aviso">📴 <b>Sem internet.</b> Mostrando as informações salvas em ' + dataCurta(d._salvoEm) + ' às ' + hora(d._salvoEm) + '. <a href="#" id="tentarNet">Tentar atualizar</a></div>'
+      : atualizando ? '<div class="mini" style="text-align:center;margin:-4px 0 10px">Atualizando…</div>' : '') +
+    (fila.length ? '<div class="aviso azul">⏳ <b>' + fila.length + ' ponto(s) guardado(s) no celular</b> esperando internet. Eles são enviados sozinhos quando o sinal voltar. <a href="#" id="enviarFila">Enviar agora</a></div>' : '') +
+    (avisos.length ? '<div class="aviso erro"><b>Ponto(s) não aceito(s) pelo servidor:</b><ul style="margin:6px 0 6px 18px;padding:0">' +
+      avisos.map(a => '<li>' + (a.tipo === 'saida' ? 'Saída' : 'Entrada') + ' de ' + dataCurta(a.hora || a.quando) + ' ' + hora(a.hora || a.quando) + ': ' + esc(a.erro) + '</li>').join('') +
+      '</ul>Procure o coordenador se precisar corrigir. <a href="#" id="okAvisos">Entendi</a></div>' : '') +
     '<div class="card">' +
       '<div class="status ' + (ab ? 'dentro' : '') + '"><div class="bola"></div><div><b>' + (ab ? 'No setor desde ' + hora(ab.entrada) : 'Fora do setor') + '</b>' +
-      '<span id="tempo">' + (ab ? 'Há ' + desde(ab.entrada) + (ab.local ? ' · ' + esc(ab.local) : '') : 'Hoje: ' + esc(hojeTxt)) + '</span></div></div>' +
+      '<span id="tempo">' + (ab ? 'Há ' + desde(ab.entrada) + (ab.local ? ' · ' + esc(ab.local) : '') + (ab.offline ? ' · sem internet' : '') : 'Hoje: ' + esc(hojeTxt)) + '</span></div></div>' +
       (ab ? '<button class="btn gigante saida" id="bater">Bater saída</button>' : '<button class="btn gigante" id="bater">Bater entrada</button>') +
     '</div>' +
 
-    '<div class="card"><h2>Atividades pendentes <span class="dir"><button class="btn sec peq" id="novaAtiv">+ Nova</button></span></h2>' +
-      (pend.length ? '<ul class="lista">' + pend.map(itemAtividade).join('') + '</ul>' : '<div class="vazio">Nenhuma atividade pendente 🎉</div>') +
+    '<div class="card"><h2>Atividades <span class="dir"><button class="btn sec peq" id="novaAtiv">+ Nova</button></span></h2>' +
+      (!pend.length ? '<div class="vazio">Nenhuma atividade em aberto 🎉</div>'
+        : ab ? '<p class="mini" style="margin-top:0">Marque o que você trabalhou hoje. Funciona sem internet e é enviado junto com a sua saída. Quem dá a baixa final é o coordenador.</p>' + checklist(pend, lerRasc(ab))
+        : '<ul class="lista">' + pend.map(itemAtividade).join('') + '</ul>') +
     '</div>' +
 
     '<div class="card"><h2>Meu mês</h2>' +
       '<div class="nums"><div><b>' + fh(m.realizado) + '</b><span>realizadas</span></div><div><b>' + fh(m.planejado) + '</b><span>planejadas até hoje</span></div>' +
       '<div><b class="pct ' + pctClasse(m.cumprimento) + '">' + (m.cumprimento == null ? '–' : m.cumprimento + '%') + '</b><span>no horário</span></div></div>' +
       '<div class="barra"><i style="width:' + pctMes + '%"></i></div>' +
-      '<div class="mini">' + fh(m.noHorario) + ' dentro do seu horário · ' + fh(m.fora) + ' fora dele' + (m.faltas ? ' · <b style="color:var(--verm)">' + m.faltas + ' dia(s) sem ponto</b>' : '') + '</div>' +
+      '<div class="mini">' + fh(m.noHorario) + ' dentro do seu horário · ' + fh(m.fora) + ' fora dele' +
+        (m.aguardando ? ' · ' + fh(m.aguardando) + ' aguardando conferência' : '') +
+        (m.faltas ? ' · <b style="color:var(--verm)">' + m.faltas + ' dia(s) sem ponto</b>' : '') + '</div>' +
     '</div>' +
 
     '<div class="card"><h2>Meu horário da semana</h2>' + gradeSemana(d.horarioSemana) + '</div>' +
@@ -378,19 +493,65 @@ function pintaAluno(d) {
     '</div>' + rodape() + '</main>';
 
   $('#bater').onclick = ab ? () => fluxoSaida(d) : fluxoEntrada;
-  $('#novaAtiv').onclick = () => novaAtividade(false, () => { render(); });
+  if (ab) ligaChecklist(app(), ab);
+  const tn = $('#tentarNet'); if (tn) tn.onclick = ev => { ev.preventDefault(); render(); };
+  const ef = $('#enviarFila'); if (ef) ef.onclick = async ev => {
+    ev.preventDefault();
+    const r = await acao('Enviando…', () => sincronizar(false)).catch(() => null);
+    if (!r) toast('Ainda sem internet. Os pontos continuam guardados.', 'erro');
+    telaAluno();
+  };
+  const oa = $('#okAvisos'); if (oa) oa.onclick = ev => { ev.preventDefault(); LS.del('avisosPonto'); mostrarAluno(st.dados); };
+  $('#novaAtiv').onclick = () => d._offline ? toast('Para cadastrar atividade precisa de internet.', 'erro') : novaAtividade(false, () => { render(); });
   $('#atualizar').onclick = () => render();
   ligaRodape();
-  if (ab) st.timer = setInterval(() => { const e = $('#tempo'); if (e) e.textContent = 'Há ' + desde(ab.entrada) + (ab.local ? ' · ' + ab.local : ''); }, 30000);
+  if (ab) st.timer = setInterval(() => { const e = $('#tempo'); if (e) e.textContent = 'Há ' + desde(ab.entrada) + (ab.local ? ' · ' + ab.local : '') + (ab.offline ? ' · sem internet' : ''); }, 30000);
 }
 
 function chipPonto(p) {
+  if (p.validacao === 'Recusado') return '<span class="chip verm">recusado</span>';
   if (p.status === 'Aberto') return '<span class="chip amar">aberto</span>';
   if (p.status === 'Sem saída') return '<span class="chip verm">sem saída</span>';
-  return '<span class="chip ok">' + fh(p.horas) + '</span>';
+  if (p.validacao === 'Pendente') return '<span class="chip amar">' + fh(p.horas) + ' · conferir</span>';
+  return '<span class="chip ok">' + fh(p.horas) + (p.origem === 'offline' ? ' · offline' : '') + '</span>';
+}
+function infoAtividade(t) {
+  const partes = [];
+  if (t.setor) partes.push(esc(t.setor));
+  if (t.aguardandoBaixa) partes.push('<b style="color:#8d6e00">aguardando baixa do coordenador</b>');
+  else if (t.participantes && t.participantes.length) partes.push('em andamento · ' + t.participantes.length + ' aluno(s)');
+  return partes.join(' · ');
+}
+function checklist(pend, rasc) {
+  return pend.map(p => {
+    const on = rasc.feitas.indexOf(String(p.id)) >= 0;
+    const term = rasc.terminou.indexOf(String(p.id)) >= 0;
+    return '<div class="check' + (on ? ' on' : '') + '" data-id="' + esc(p.id) + '"><input type="checkbox" class="cb-feito"' + (on ? ' checked' : '') + ' aria-label="Trabalhei nesta atividade">' +
+      '<div style="flex:1"><div style="font-weight:600">' + esc(p.descricao) + ' <span class="chip ' + esc(p.prioridade) + '">' + esc(p.prioridade) + '</span></div>' +
+      '<div class="mini">' + infoAtividade(p) + '</div>' +
+      '<label class="term"><input type="checkbox" class="cb-term"' + (term ? ' checked' : '') + '> Terminei esta atividade (avisar o coordenador)</label></div></div>';
+  }).join('');
+}
+function ligaChecklist(el, ab) {
+  const salvar = () => {
+    const r = lerRasc(ab);
+    r.feitas = $$('.check', el).filter(c => $('.cb-feito', c).checked).map(c => c.dataset.id);
+    r.terminou = $$('.check', el).filter(c => $('.cb-feito', c).checked && $('.cb-term', c).checked).map(c => c.dataset.id);
+    salvarRasc(r);
+  };
+  $$('.check', el).forEach(c => {
+    const cb = $('.cb-feito', c);
+    c.onclick = ev => {
+      if (ev.target.closest('.term')) return;
+      if (ev.target !== cb) cb.checked = !cb.checked;
+      c.classList.toggle('on', cb.checked);
+      salvar();
+    };
+    $('.cb-term', c).onchange = salvar;
+  });
 }
 function itemAtividade(t) {
-  return '<li><div class="info"><div class="t">' + esc(t.descricao) + '</div><div class="m">' + (t.setor ? esc(t.setor) + ' · ' : '') + 'por ' + esc(t.criadaPor) + ' em ' + dataCurta(t.criadaEm) + '</div></div>' +
+  return '<li><div class="info"><div class="t">' + esc(t.descricao) + '</div><div class="m">' + (infoAtividade(t) || 'criada por ' + esc(t.criadaPor) + ' em ' + dataCurta(t.criadaEm)) + '</div></div>' +
     '<span class="chip ' + esc(t.prioridade) + '">' + esc(t.prioridade) + '</span></li>';
 }
 function gradeSemana(slots) {
@@ -401,54 +562,93 @@ function gradeSemana(slots) {
   }).join('');
 }
 
+/* ------------------------- registrar ponto (com ou sem internet) ------------------------- */
+async function registrarPonto(tipo, extra) {
+  const locP = obterLocal(); locP.catch(() => {});
+  const cap = await capturarRosto('ponto');
+  carregando('Conferindo localização…');
+  const loc = await locP;
+  const base = Object.assign({ uid: novoUid(), tipo, descritor: cap.descritores[0], vivacidade: true, lat: loc.lat, lng: loc.lng, precisao: loc.prec }, extra || {});
+  const horaCelular = Date.now();
+
+  if (navigator.onLine !== false) {
+    carregando(tipo === 'entrada' ? 'Registrando entrada…' : 'Registrando saída…');
+    try {
+      if (Fila.ler().length && !(await sincronizar(true))) throw erroRede('fila');
+      const r = await api('baterPonto', Object.assign({ token: st.token }, base), { tempo: 25000 });
+      guardaRelogio(Date.parse(r.hora));
+      return { online: true, r };
+    } catch (e) {
+      if (!e.rede) throw e; // erro de verdade (rosto, local...): não guarda
+    }
+  }
+  // Sem internet: confere aqui no celular e guarda na fila
+  const local = conferirNoCelular(base.descritor, loc, st.dados && st.dados.offline);
+  const it = Object.assign({ horaCelular, offsetAntes: offsetRelogio(), local }, base);
+  Fila.add(it);
+  return { online: false, hora: new Date(horaCelular + (it.offsetAntes || 0)).toISOString(), local };
+}
+
 async function fluxoEntrada() {
   try {
-    const locP = obterLocal(); locP.catch(() => {});
-    const cap = await capturarRosto('ponto');
-    carregando('Conferindo localização…');
-    const loc = await locP;
-    carregando('Registrando entrada…');
-    const r = await api('baterPonto', { token: st.token, tipo: 'entrada', descritor: cap.descritores[0], vivacidade: true, lat: loc.lat, lng: loc.lng, precisao: loc.prec });
+    const res = await registrarPonto('entrada');
     carregando(false);
+    const d = st.dados;
+    const hr = res.online ? res.r.hora : res.hora;
+    const loc = res.online ? res.r.local : res.local;
+    if (d) {
+      d.aberto = { entrada: hr, local: loc, offline: !res.online };
+      if (res.online) d.pendentes = res.r.pendentes;
+      d._salvoEm = d._salvoEm || Date.now(); salvarCache(d);
+    }
+    const pend = d ? d.pendentes : [];
     const t = abrirTela('Entrada registrada',
-      '<div class="sucesso"><div class="icone">✓</div><h2>Entrada às ' + hora(r.hora) + '</h2><p>' + (r.local ? esc(r.local) + ' · ' : '') + 'Bom trabalho!</p></div>' +
+      '<div class="sucesso"><div class="icone">' + (res.online ? '✓' : '⏳') + '</div><h2>Entrada às ' + hora(hr) + '</h2><p>' + (loc ? esc(loc) + ' · ' : '') + 'Bom trabalho!</p></div>' +
+      (res.online ? '' : '<div class="aviso azul" style="margin-top:14px">Você está sem internet. A entrada ficou <b>guardada no celular</b> e será enviada sozinha quando o sinal voltar.</div>') +
+      (res.online && res.r.pendente ? '<div class="aviso" style="margin-top:14px">Este ponto vai passar pela conferência do coordenador.</div>' : '') +
       '<div class="card" style="margin-top:20px"><h2>O que tem para fazer</h2>' +
-      (r.pendentes.length ? '<ul class="lista">' + r.pendentes.map(itemAtividade).join('') + '</ul>' : '<div class="vazio">Nenhuma atividade pendente cadastrada.</div>') +
+      (pend.length ? '<ul class="lista">' + pend.map(itemAtividade).join('') + '</ul>' : '<div class="vazio">Nenhuma atividade em aberto.</div>') +
       '</div><button class="btn" data-ok>Começar</button>', { semFechar: true });
-    $('[data-ok]', t).onclick = () => render();
+    $('[data-ok]', t).onclick = () => { t.remove(); mostrarAluno(st.dados); };
   } catch (e) {
     carregando(false);
-    if (!e.cancelado) { toast(e.message, 'erro'); if (e.token) { LS.del('token'); st.token = null; render(); } }
+    if (!e.cancelado) { toast(e.message, 'erro'); if (e.token) { sairDoCelular(); render(); } }
   }
 }
 
 function fluxoSaida(d) {
   const pend = d.pendentes;
+  const ab = d.aberto;
+  const rasc = lerRasc(ab);
   const t = abrirTela('Bater saída',
     '<div class="card"><h2>O que você fez hoje?</h2>' +
-    (pend.length ? '<p class="mini" style="margin-top:0">Marque as atividades que você concluiu:</p>' + pend.map(p =>
-      '<label class="check"><input type="checkbox" value="' + esc(p.id) + '"><div><div class="t" style="font-weight:600">' + esc(p.descricao) + '</div><div class="mini">' + (p.setor ? esc(p.setor) + ' · ' : '') + esc(p.prioridade) + '</div></div></label>').join('')
-      : '<div class="vazio">Nenhuma atividade pendente.</div>') +
-    '<div class="campo" style="margin-top:14px"><label>Observação (opcional)</label><textarea id="obs" rows="3" placeholder="Ex.: faltou arame para terminar a cerca"></textarea></div></div>' +
-    '<button class="btn gigante saida" id="confirma">Confirmar saída com o rosto</button>');
-  $$('.check input', t).forEach(c => c.onchange = () => c.closest('.check').classList.toggle('on', c.checked));
+    (pend.length ? '<p class="mini" style="margin-top:0">Marque as atividades em que você trabalhou. Se terminou alguma, marque também “Terminei”.</p>' + checklist(pend, rasc)
+      : '<div class="vazio">Nenhuma atividade em aberto.</div>') +
+    '<div class="campo" style="margin-top:14px"><label>Observação (opcional)</label><textarea id="obs" rows="3" placeholder="Ex.: faltou arame para terminar a cerca">' + esc(rasc.obs) + '</textarea></div></div>' +
+    '<div class="mini" style="text-align:center;margin-bottom:10px">Funciona com ou sem internet. Sem sinal, a saída fica guardada e é enviada depois.</div>' +
+    '<button class="btn gigante saida" id="confirma">Confirmar saída com o rosto</button>',
+    { aoFechar: () => mostrarAluno(st.dados) });
+  ligaChecklist(t, ab);
+  $('#obs', t).oninput = () => { const r = lerRasc(ab); r.obs = $('#obs', t).value; salvarRasc(r); };
   $('#confirma', t).onclick = async () => {
-    const marcadas = $$('.check input:checked', t).map(c => c.value);
+    const r0 = lerRasc(ab);
+    const marcadas = r0.feitas.slice(), terminou = r0.terminou.filter(x => marcadas.indexOf(x) >= 0);
     const obs = $('#obs', t).value;
     try {
-      const locP = obterLocal(); locP.catch(() => {});
-      const cap = await capturarRosto('ponto');
-      carregando('Conferindo localização…');
-      const loc = await locP;
-      carregando('Registrando saída…');
-      const r = await api('baterPonto', { token: st.token, tipo: 'saida', descritor: cap.descritores[0], vivacidade: true, lat: loc.lat, lng: loc.lng, precisao: loc.prec, atividades: marcadas, observacao: obs });
+      const res = await registrarPonto('saida', { atividades: marcadas, terminou, observacao: obs });
       carregando(false);
       t.remove();
+      LS.del('rascunhoSaida');
+      if (st.dados) { st.dados.aberto = null; salvarCache(st.dados); }
+      const nomes = pend.filter(p => marcadas.indexOf(String(p.id)) >= 0).map(p => p.descricao + (terminou.indexOf(String(p.id)) >= 0 ? ' (terminei)' : ''));
+      const hr = res.online ? res.r.hora : res.hora;
       const s = abrirTela('Saída registrada',
-        '<div class="sucesso"><div class="icone">✓</div><h2>Saída às ' + hora(r.hora) + '</h2><p>Hoje: <b>' + fh(r.horas) + '</b> (' + fh(r.noHorario) + ' no seu horário' + (r.fora > 0 ? ', ' + fh(r.fora) + ' fora' : '') + ')</p></div>' +
-        (r.feitas.length ? '<div class="card" style="margin-top:20px"><h2>Concluídas</h2><ul class="lista">' + r.feitas.map(f => '<li>✓ ' + esc(f) + '</li>').join('') + '</ul></div>' : '') +
+        '<div class="sucesso"><div class="icone">' + (res.online ? '✓' : '⏳') + '</div><h2>Saída às ' + hora(hr) + '</h2>' +
+        (res.online ? '<p>Hoje: <b>' + fh(res.r.horas) + '</b> (' + fh(res.r.noHorario) + ' no seu horário' + (res.r.fora > 0 ? ', ' + fh(res.r.fora) + ' fora' : '') + ')</p>' : '<p>Guardada no celular</p>') + '</div>' +
+        (res.online ? '' : '<div class="aviso azul" style="margin-top:14px">Você está sem internet. A saída e as atividades foram <b>guardadas no celular</b> e serão enviadas sozinhas quando o sinal voltar.</div>') +
+        (nomes.length ? '<div class="card" style="margin-top:20px"><h2>Você trabalhou em</h2><ul class="lista">' + nomes.map(f => '<li>✓ ' + esc(f) + '</li>').join('') + '</ul></div>' : '') +
         '<button class="btn" data-ok style="margin-top:16px">Até a próxima!</button>', { semFechar: true });
-      $('[data-ok]', s).onclick = () => render();
+      $('[data-ok]', s).onclick = () => { s.remove(); res.online ? render() : mostrarAluno(st.dados); };
     } catch (e) {
       carregando(false);
       if (!e.cancelado) toast(e.message, 'erro');
@@ -480,7 +680,7 @@ function ligaRodape() {
   $$('[data-coord]').forEach(b => b.onclick = () => { location.hash = '#coordenador'; });
   $$('[data-sair]').forEach(b => b.onclick = async () => {
     if (await confirmar('Desativar este celular? Para usar de novo você vai precisar de um novo código do coordenador.', 'Desativar', true)) {
-      LS.del('token'); st.token = null; st.dados = null; render();
+      sairDoCelular(); render();
     }
   });
 }
@@ -519,8 +719,9 @@ async function telaAdmin(silencioso) {
     }
   }
   const D = st.admin.dados;
-  const pendRosto = D.alunos.filter(a => a.rostoStatus === 'Pendente').length;
-  const abas = [['agora', 'Agora' + (pendRosto ? ' •' : '')], ['alunos', 'Alunos'], ['atividades', 'Atividades'], ['relatorio', 'Horas'], ['ajustes', 'Ajustes']];
+  const pendRosto = D.alunos.filter(a => a.rostoStatus === 'Pendente').length + (D.paraValidar || []).length;
+  const aguardBaixa = D.atividades.filter(t => t.status !== 'Concluída' && t.aguardandoBaixa).length;
+  const abas = [['agora', 'Agora' + (pendRosto ? ' •' : '')], ['alunos', 'Alunos'], ['atividades', 'Atividades' + (aguardBaixa ? ' (' + aguardBaixa + ')' : '')], ['relatorio', 'Horas'], ['ajustes', 'Ajustes']];
   app().innerHTML = topo(D.config.NOME_GRUPO || 'Coordenador', 'Painel do coordenador', '<button id="atualizarAdm" aria-label="Atualizar">↻</button><button id="sairAdm">Sair</button>') +
     '<nav class="abas">' + abas.map(a => '<button data-aba="' + a[0] + '" class="' + (st.admin.aba === a[0] ? 'on' : '') + '">' + a[1] + '</button>').join('') + '</nav>' +
     '<main id="conteudo"></main>';
@@ -548,6 +749,12 @@ function abaAgora() {
       '<div class="info"><div class="t">' + esc(a.nome) + '</div><div class="m">Cadastrado em ' + dataCurta(a.dataCadastro) + ' às ' + hora(a.dataCadastro) + '</div>' +
       '<div class="linha-btn" style="margin-top:8px"><button class="btn peq" data-aprovar="' + esc(a.id) + '">Aprovar</button><button class="btn peq cinza" data-recusar="' + esc(a.id) + '">Recusar</button></div></div></li>').join('') +
       '</ul><div class="mini" style="margin-top:8px">A foto serve só para você conferir e é apagada assim que você aprova ou recusa.</div></div>' : '') +
+
+    (D.paraValidar.length ? '<div class="card"><h2>Pontos sem internet para conferir (' + D.paraValidar.length + ')</h2><ul class="lista">' + D.paraValidar.map(p =>
+      '<li><div class="info"><div class="t">' + esc(p.aluno) + '</div><div class="m">' + diaSem(p.entrada) + ' ' + dataCurta(p.entrada) + ' · ' + hora(p.entrada) + ' – ' + (p.saida ? hora(p.saida) : '…') + (p.horas != null ? ' · ' + fh(p.horas) : '') + '</div>' +
+      (p.alerta ? '<div class="m" style="color:var(--verm)">⚠ ' + esc(p.alerta) + '</div>' : '<div class="m">Registrado sem internet</div>') +
+      '<div class="linha-btn" style="margin-top:8px"><button class="btn peq" data-val="' + esc(p.id) + '">Validar</button><button class="btn peq cinza" data-rec="' + esc(p.id) + '">Recusar</button></div></div></li>').join('') +
+      '</ul><div class="mini" style="margin-top:8px">Horas desses pontos só entram no relatório depois de validadas.</div></div>' : '') +
 
     '<div class="card"><h2>No setor agora (' + D.noSetor.length + ')</h2>' +
       (D.noSetor.length ? '<ul class="lista">' + D.noSetor.map(p => '<li><span class="avatar">' + esc(iniciais(p.aluno)) + '</span><div class="info"><div class="t">' + esc(p.aluno) + '</div><div class="m">desde ' + hora(p.entrada) + ' · há ' + desde(p.entrada) + (p.local ? ' · ' + esc(p.local) : '') + '</div></div></li>').join('') + '</ul>'
@@ -579,6 +786,12 @@ function abaAgora() {
     $('#ok', t).onclick = async () => {
       try { await acao('Salvando…', () => api('adminPonto', Object.assign(S(), { id: b.dataset.ajustar, op: 'saida', saida: $('#hs', t).value }))); t.remove(); recarregaAdmin(); } catch (e) { /* */ }
     };
+  });
+  $$('[data-val]').forEach(b => b.onclick = async () => { await acao('Validando…', () => api('adminPonto', Object.assign(S(), { id: b.dataset.val, op: 'validar' }))).catch(() => {}); recarregaAdmin(); });
+  $$('[data-rec]').forEach(b => b.onclick = async () => {
+    if (!await confirmar('Recusar este ponto? As horas dele não vão contar.', 'Recusar', true)) return;
+    await acao('Recusando…', () => api('adminPonto', Object.assign(S(), { id: b.dataset.rec, op: 'recusar' }))).catch(() => {});
+    recarregaAdmin();
   });
   $$('[data-excluir-ponto]').forEach(b => b.onclick = async () => {
     if (!await confirmar('Excluir este ponto?', 'Excluir', true)) return;
@@ -675,23 +888,34 @@ function editarAluno(a) {
 /* ---------- Aba Atividades ---------- */
 function abaAtividades() {
   const D = st.admin.dados;
-  const f = st.admin.filtroAtiv;
-  const lista = D.atividades.filter(t => f === 'Pendente' ? t.status !== 'Concluída' : t.status === 'Concluída')
-    .sort((x, y) => f === 'Pendente' ? (['Urgente', 'Normal', 'Baixa'].indexOf(x.prioridade) - ['Urgente', 'Normal', 'Baixa'].indexOf(y.prioridade)) : (new Date(y.concluidaEm) - new Date(x.concluidaEm)));
+  const f = st.admin.filtroAtiv || 'abertas';
+  const ordemP = p => ['Urgente', 'Normal', 'Baixa'].indexOf(p);
+  const aguard = D.atividades.filter(t => t.status !== 'Concluída' && t.aguardandoBaixa);
+  const lista = D.atividades.filter(t => f === 'baixa' ? (t.status !== 'Concluída' && t.aguardandoBaixa) : f === 'abertas' ? t.status !== 'Concluída' : t.status === 'Concluída')
+    .sort((x, y) => f === 'Concluída' ? (new Date(y.concluidaEm) - new Date(x.concluidaEm)) : ((y.aguardandoBaixa ? 1 : 0) - (x.aguardandoBaixa ? 1 : 0)) || (ordemP(x.prioridade) - ordemP(y.prioridade)));
+  const bt = (k, txt) => '<button class="btn peq ' + (f === k ? '' : 'cinza') + '" data-f="' + k + '">' + txt + '</button>';
   $('#conteudo').innerHTML = '<button class="btn" id="novaA" style="margin-bottom:12px">+ Nova atividade</button>' +
-    '<div class="linha-btn" style="margin-bottom:12px"><button class="btn peq ' + (f === 'Pendente' ? '' : 'cinza') + '" data-f="Pendente">Pendentes</button><button class="btn peq ' + (f === 'Concluída' ? '' : 'cinza') + '" data-f="Concluída">Concluídas (60 dias)</button></div>' +
-    '<div class="card">' + (lista.length ? '<ul class="lista">' + lista.map(t =>
-      '<li><div class="info"><div class="t">' + esc(t.descricao) + '</div><div class="m">' + (t.setor ? esc(t.setor) + ' · ' : '') +
-      (t.status === 'Concluída' ? '✓ ' + esc(t.concluidaPor) + ' em ' + dataCurta(t.concluidaEm) + ' ' + hora(t.concluidaEm) : 'criada por ' + esc(t.criadaPor) + ' em ' + dataCurta(t.criadaEm)) + '</div>' +
-      '<div class="linha-btn" style="margin-top:8px">' + (t.status === 'Concluída' ? '<button class="btn peq sec" data-op="reabrir" data-id="' + esc(t.id) + '">Reabrir</button>'
-        : '<button class="btn peq sec" data-op="concluir" data-id="' + esc(t.id) + '">Marcar concluída</button>') +
-      '<button class="btn peq cinza" data-op="excluir" data-id="' + esc(t.id) + '">Excluir</button></div></div>' +
-      (t.status === 'Concluída' ? '' : '<span class="chip ' + esc(t.prioridade) + '">' + esc(t.prioridade) + '</span>') + '</li>').join('') + '</ul>'
-      : '<div class="vazio">Nada por aqui.</div>') + '</div>';
+    '<div class="linha-btn" style="margin-bottom:12px">' + bt('baixa', 'Aguardando baixa (' + aguard.length + ')') + bt('abertas', 'Em aberto') + bt('Concluída', 'Finalizadas') + '</div>' +
+    '<div class="card">' + (lista.length ? '<ul class="lista">' + lista.map(t => {
+      const regs = t.registros || [];
+      return '<li><div class="info"><div class="t">' + esc(t.descricao) + ' <span class="chip ' + esc(t.prioridade) + '">' + esc(t.prioridade) + '</span>' +
+        (t.status !== 'Concluída' && t.aguardandoBaixa ? ' <span class="chip amar">aguardando baixa</span>' : '') + '</div>' +
+        '<div class="m">' + (t.setor ? esc(t.setor) + ' · ' : '') + 'criada por ' + esc(t.criadaPor) + ' em ' + dataCurta(t.criadaEm) +
+        (t.status === 'Concluída' ? ' · <b>finalizada em ' + dataCurta(t.concluidaEm) + '</b>' : '') + '</div>' +
+        (regs.length ? '<div class="part">Quem trabalhou: ' + regs.map(r => '<span>' + esc(r.aluno) + ' ' + dataCurta(r.data) + (r.terminou ? ' ✓ terminou' : '') + '</span>').join('') + '</div>'
+          : '<div class="part">Ninguém registrou trabalho ainda.</div>') +
+        '<div class="linha-btn" style="margin-top:8px">' +
+        (t.status === 'Concluída' ? '<button class="btn peq sec" data-op="reabrir" data-id="' + esc(t.id) + '">Reabrir</button>'
+          : '<button class="btn peq" data-op="concluir" data-id="' + esc(t.id) + '">✓ Dar baixa (finalizar)</button>' +
+            (t.aguardandoBaixa ? '<button class="btn peq sec" data-op="continuar" data-id="' + esc(t.id) + '">Ainda não terminou</button>' : '')) +
+        '<button class="btn peq cinza" data-op="excluir" data-id="' + esc(t.id) + '">Excluir</button></div></div></li>';
+    }).join('') + '</ul>'
+      : '<div class="vazio">Nada por aqui.</div>') + '</div>' +
+    '<p class="mini">Os alunos marcam no ponto de saída em que atividades trabalharam (e se acham que terminaram). Só você dá a baixa final.</p>';
   $('#novaA').onclick = () => novaAtividade(true, recarregaAdmin);
   $$('[data-f]').forEach(b => b.onclick = () => { st.admin.filtroAtiv = b.dataset.f; abaAtividades(); });
   $$('[data-op]').forEach(b => b.onclick = async () => {
-    if (b.dataset.op === 'excluir' && !await confirmar('Excluir esta atividade?', 'Excluir', true)) return;
+    if (b.dataset.op === 'excluir' && !await confirmar('Excluir esta atividade? O histórico de quem trabalhou nela continua na aba Registros da planilha.', 'Excluir', true)) return;
     await acao('Salvando…', () => api('adminAtividade', Object.assign(S(), { id: b.dataset.id, op: b.dataset.op }))).catch(() => {});
     recarregaAdmin();
   });
@@ -713,36 +937,50 @@ async function abaRelatorio() {
   $('#rel').innerHTML =
     '<div class="card"><h2>Grupo no mês</h2><div class="nums"><div><b>' + fh(tot.r) + '</b><span>realizadas</span></div><div><b>' + fh(tot.p) + '</b><span>planejadas</span></div>' +
     '<div><b class="pct ' + pctClasse(tot.p ? Math.round(tot.n / tot.p * 100) : null) + '">' + (tot.p ? Math.round(Math.min(tot.n, tot.p) / tot.p * 100) + '%' : '–') + '</b><span>cumprimento</span></div></div></div>' +
-    '<div class="card"><h2>Por aluno <span class="dir"><button class="btn sec peq" id="csv">Baixar planilha</button></span></h2>' +
+    '<div class="linha-btn" style="margin-bottom:14px"><button class="btn sec peq" id="csv">⬇ Planilha de horas</button><button class="btn sec peq" id="csvAtiv">⬇ Planilha de atividades</button></div>' +
+    '<div class="card"><h2>Por aluno</h2>' +
     '<ul class="lista rel-lista">' + R.alunos.map(a => '<li data-rel="' + esc(a.id) + '"><div class="info"><div class="t">' + esc(a.nome) + '</div>' +
       '<div class="m">' + fh(a.realizado) + ' feitas de ' + fh(a.planejado) + ' planejadas · ' + fh(a.fora) + ' fora do horário' +
-      (a.faltas ? ' · <b style="color:var(--verm)">' + a.faltas + ' dia(s) sem ponto</b>' : '') + (a.semSaida ? ' · ' + a.semSaida + ' sem saída' : '') + '</div>' +
+      (a.faltas ? ' · <b style="color:var(--verm)">' + a.faltas + ' dia(s) sem ponto</b>' : '') + (a.semSaida ? ' · ' + a.semSaida + ' sem saída' : '') + (a.aguardando ? ' · ' + fh(a.aguardando) + ' a conferir' : '') + ' · ' + (a.atividades || []).length + ' atividade(s)</div>' +
       '<div class="barra" style="height:6px"><i style="width:' + (a.planejado ? Math.min(100, Math.round(a.realizado / a.planejado * 100)) : 0) + '%"></i></div></div>' +
       '<b class="pct ' + pctClasse(a.cumprimento) + '" style="font-size:18px">' + (a.cumprimento == null ? '–' : a.cumprimento + '%') + '</b></li>').join('') + '</ul><p class="mini">Cumprimento = horas feitas dentro do horário planejado ÷ horas planejadas. Horas fora do horário também contam no total realizado. Toque num aluno para ver os pontos.</p></div>';
   $$('[data-rel]').forEach(tr => tr.onclick = () => detalheAluno(R.alunos.find(a => a.id === tr.dataset.rel)));
   $('#csv').onclick = () => baixarCSV(R);
+  $('#csvAtiv').onclick = () => baixarAtividadesCSV(R);
 }
 
 function detalheAluno(a) {
+  const ativ = a.atividades || [];
   abrirTela(a.nome,
     '<div class="card"><div class="nums"><div><b>' + fh(a.realizado) + '</b><span>realizadas</span></div><div><b>' + fh(a.planejado) + '</b><span>planejadas</span></div><div><b class="pct ' + pctClasse(a.cumprimento) + '">' + (a.cumprimento == null ? '–' : a.cumprimento + '%') + '</b><span>cumprimento</span></div></div>' +
-    '<p class="mini">' + fh(a.noHorario) + ' no horário · ' + fh(a.fora) + ' fora · ' + a.diasPlanejados + ' dia(s) planejado(s) · ' + a.faltas + ' dia(s) sem ponto</p></div>' +
+    '<p class="mini">' + fh(a.noHorario) + ' no horário · ' + fh(a.fora) + ' fora · ' + a.diasPlanejados + ' dia(s) planejado(s) · ' + a.faltas + ' dia(s) sem ponto' + (a.aguardando ? ' · ' + fh(a.aguardando) + ' aguardando sua conferência' : '') + '</p></div>' +
+    '<div class="card"><h2>O que fez no mês (' + ativ.length + ')</h2>' + (ativ.length ? '<ul class="lista">' + ativ.map(x =>
+      '<li><div class="info"><div class="t">' + esc(x.atividade) + '</div><div class="m">' + diaSem(x.data) + ' ' + dataCurta(x.data) + ' às ' + hora(x.data) + '</div></div>' + (x.terminou ? '<span class="chip ok">terminou</span>' : '') + '</li>').join('') + '</ul>'
+      : '<div class="vazio">Nenhuma atividade registrada neste mês.</div>') + '</div>' +
     '<div class="card"><h2>Pontos do mês</h2>' + (a.sessoes.length ? '<ul class="lista">' + a.sessoes.map(p =>
       '<li><div class="info"><div class="t">' + diaSem(p.entrada) + ' ' + dataCurta(p.entrada) + ' · ' + hora(p.entrada) + ' – ' + (p.saida ? hora(p.saida) : '…') + '</div>' +
-      '<div class="m">' + (p.horas != null && p.status !== 'Sem saída' ? fh(p.noHorario) + ' no horário, ' + fh(p.fora) + ' fora' : '') + (p.atividades ? ' · ✓ ' + esc(p.atividades) : '') + (p.obs ? ' · “' + esc(p.obs) + '”' : '') + '</div></div>' + chipPonto(p) + '</li>').join('') + '</ul>'
+      '<div class="m">' + (p.horas != null && p.status !== 'Sem saída' ? fh(p.noHorario) + ' no horário, ' + fh(p.fora) + ' fora' : '') + (p.atividades ? ' · ✓ ' + esc(p.atividades) : '') + (p.obs ? ' · “' + esc(p.obs) + '”' : '') + (p.alerta ? ' · ⚠ ' + esc(p.alerta) : '') + '</div></div>' + chipPonto(p) + '</li>').join('') + '</ul>'
       : '<div class="vazio">Nenhum ponto neste mês.</div>') + '</div>');
 }
 
-function baixarCSV(R) {
-  const n = v => String(v == null ? '' : v).replace('.', ',');
-  const linhas = [['Aluno', 'Matrícula', 'Horas planejadas', 'Horas realizadas', 'Horas no horário', 'Horas fora do horário', 'Cumprimento (%)', 'Dias planejados', 'Dias sem ponto', 'Pontos sem saída']]
-    .concat(R.alunos.map(a => [a.nome, a.matricula, n(a.planejado), n(a.realizado), n(a.noHorario), n(a.fora), a.cumprimento == null ? '' : a.cumprimento, a.diasPlanejados, a.faltas, a.semSaida]));
+function baixarArquivo(nome, linhas) {
   const csv = '﻿' + linhas.map(l => l.map(c => '"' + String(c == null ? '' : c).replace(/"/g, '""') + '"').join(';')).join('\r\n');
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
   const a = document.createElement('a');
-  a.href = url; a.download = 'relatorio-horas-' + R.mes + '.csv';
+  a.href = url; a.download = nome;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+function baixarCSV(R) {
+  const n = v => String(v == null ? '' : v).replace('.', ',');
+  baixarArquivo('relatorio-horas-' + R.mes + '.csv', [['Aluno', 'Matrícula', 'Horas planejadas', 'Horas realizadas', 'Horas no horário', 'Horas fora do horário', 'Cumprimento (%)', 'Dias planejados', 'Dias sem ponto', 'Pontos sem saída', 'Horas aguardando conferência']]
+    .concat(R.alunos.map(a => [a.nome, a.matricula, n(a.planejado), n(a.realizado), n(a.noHorario), n(a.fora), a.cumprimento == null ? '' : a.cumprimento, a.diasPlanejados, a.faltas, a.semSaida, n(a.aguardando)])));
+}
+function baixarAtividadesCSV(R) {
+  const linhas = [['Data', 'Hora', 'Aluno', 'Atividade', 'Disse que terminou']];
+  R.alunos.forEach(a => (a.atividades || []).forEach(x => linhas.push([new Date(x.data).toLocaleDateString('pt-BR'), hora(x.data), a.nome, x.atividade, x.terminou ? 'Sim' : ''])));
+  linhas.splice(1, linhas.length, ...linhas.slice(1).sort((p, q) => p[0].split('/').reverse().join('').localeCompare(q[0].split('/').reverse().join('')) || p[1].localeCompare(q[1])));
+  baixarArquivo('atividades-' + R.mes + '.csv', linhas);
 }
 
 /* ---------- Aba Ajustes ---------- */
@@ -766,6 +1004,8 @@ function abaAjustes() {
 
     '<div class="card"><h2>Geral</h2>' +
       '<div class="campo"><label>Nome do grupo</label><input id="cNome" value="' + esc(C.NOME_GRUPO) + '"></div>' +
+      '<div class="campo"><label>Ponto sem internet</label><select id="cOff"><option value="SIM"' + (C.PONTO_OFFLINE !== 'NAO' ? ' selected' : '') + '>Permitir (fica guardado e é enviado depois)</option><option value="NAO"' + (C.PONTO_OFFLINE === 'NAO' ? ' selected' : '') + '>Não permitir</option></select></div>' +
+      '<div class="campo"><label>Pontos feitos sem internet</label><select id="cAprov"><option value="AUTO"' + (C.APROVAR_OFFLINE !== 'MANUAL' ? ' selected' : '') + '>Valem sozinhos; só os suspeitos esperam minha conferência</option><option value="MANUAL"' + (C.APROVAR_OFFLINE === 'MANUAL' ? ' selected' : '') + '>Todos esperam minha conferência</option></select></div>' +
       '<div class="campo"><label>Exigir estar no local</label><select id="cLocal"><option value="SIM"' + (C.EXIGIR_LOCAL !== 'NAO' ? ' selected' : '') + '>Sim (recomendado)</option><option value="NAO"' + (C.EXIGIR_LOCAL === 'NAO' ? ' selected' : '') + '>Não</option></select></div>' +
       '<div class="campo"><label>Rigor do reconhecimento facial</label><select id="cLim">' +
         [['0.45', 'Alto (pode pedir para repetir mais vezes)'], ['0.5', 'Normal (recomendado)'], ['0.55', 'Tolerante']].map(o => '<option value="' + o[0] + '"' + (String(C.LIMIAR_ROSTO) === o[0] ? ' selected' : '') + '>' + o[1] + '</option>').join('') + '</select></div>' +
@@ -810,6 +1050,7 @@ function abaAjustes() {
   $('#salvarCfg').onclick = async () => {
     const dados = Object.assign(S(), {
       NOME_GRUPO: $('#cNome').value, EXIGIR_LOCAL: $('#cLocal').value, LIMIAR_ROSTO: $('#cLim').value,
+      PONTO_OFFLINE: $('#cOff').value, APROVAR_OFFLINE: $('#cAprov').value,
       INICIO_SEMESTRE: $('#cIni').value, FIM_SEMESTRE: $('#cFim').value
     });
     const nova = $('#cSenha').value;
